@@ -1,0 +1,125 @@
+#!/usr/bin/python
+import os
+import subprocess
+import shlex
+import sys
+import argparse
+
+parser = argparse.ArgumentParser(description="""
+  copies data to/from your pod
+
+  requires that rsync is installed on the remote host, but not running as a daemon
+  and assumes root privileges in the pod. 
+""")
+parser.add_argument('source', nargs="+", help="source files")
+parser.add_argument('dest', nargs=1, help="destination file or directory")
+parser.add_argument('--rsyncopts', dest='rsyncopts',
+                    help="options passed to rsync")
+parser.set_defaults(rsyncopts="")
+parser.add_argument('--force', dest='force', action='store_true',
+                    help="overwrite an existing /etc/rsyncd.conf")
+parser.set_defaults(force=False)
+parser.add_argument('--host', dest='source_host',
+                    help="specifies a remote host for all source files")
+parser.set_defaults(source_host=None)
+parser.add_argument('--debug', dest='debug',
+                    action='store_true', help="more debug info")
+parser.set_defaults(debug=False)
+args = parser.parse_args()
+
+
+def debug(log):
+    if args.debug:
+        print(log)
+
+
+def shell(cmd, sh=True):
+    debug("Command: " + cmd)
+    if sh:
+        return subprocess.check_output("sh -c '" + cmd + "'", shell=True)
+    return subprocess.check_output(shlex.split(cmd))
+
+# sets up rsync by copying a hard coded /etc/rsyncd.conf to the pod
+
+
+def setup_remote(pod):
+    RSYNCD_CONF = """
+lock file = /var/run/rsync.lock
+log file = /var/log/rsyncd.log
+pid file = /var/run/rsyncd.pid
+
+[root_module]
+    path = /
+    comment = none
+    uid = root
+    gid = root
+    read only = no
+    list = yes
+"""
+    try:
+        shell("kubectl exec {} -- sh -c \"which rsync\"".format(pod))
+    except:
+        raise BaseException("remote host {} cannot run rsync".format(pod))
+    if not args.force:
+        conf = shell(
+            "kubectl exec {} -- sh -c \"if [ -f /etc/rsyncd.conf ]; then cat /etc/rsyncd.conf ; fi\"".format(pod))
+        if conf != "" and conf.strip() != RSYNCD_CONF.strip():
+            raise BaseException(
+                "remote rsyncd.conf exists, not overwriting without --force")
+    cmd = "kubectl exec {} -- sh -c 'cat > /etc/rsyncd.conf'".format(pod)
+    debug(cmd)
+    sub = subprocess.Popen(
+        "kubectl exec -i {} -- sh -c 'cat > /etc/rsyncd.conf'".format(pod), shell=True, stdin=subprocess.PIPE)
+    stdout, stderr = sub.communicate(RSYNCD_CONF)
+    debug("rsyncd.conf created")
+    return True
+
+
+def cleanup_remote(pod):
+    debug("deleting rsyncd.conf")
+    # return shell("kubectl exec {} -- rm /etc/rsyncd.conf".format(pod))
+
+
+def parse_path(path):
+    pos = path.find(":")
+    if pos == -1:
+        return (None, path)
+    if pos == 0:
+        raise BaseException("Invalid filename " + path)
+    else:
+        return(path[0:pos], path[pos + 1:])
+
+
+def copy(src, dest):
+    rsync_url = "rsync://--/root_module/"
+    src_host = args.source_host
+    dest_host, dest_path = parse_path(dest)
+    src_paths = []
+    for f in src:
+        h, p = parse_path(f)
+        if src_host == None:
+            src_host = h
+        else:
+            if not args.source_host and h != src_host:
+                raise BaseException("All source paths must have the same host")
+        src_paths.append(p)
+    if src_host is None:
+        # setup copy from local to remote
+        pod = dest_host
+        source = " ".join(src)
+        destination = rsync_url + dest_path
+    else:
+        # setup copy from remote to local
+        pod = src_host
+        source = " ".join([rsync_url + x for x in src_paths])
+        if dest_host is not None:
+            raise BaseException("Source and destination cannot be remote")
+        destination = dest_path
+    setup_remote(pod)
+    print(shell("rsync --blocking-io -Rza " + args.rsyncopts + " -e 'kubectl exec -i " +
+                pod + "' " + source + " " + destination, sh=False).strip())
+    cleanup_remote(pod)
+    return
+
+debug(args)
+copy(args.source, args.dest[0])
